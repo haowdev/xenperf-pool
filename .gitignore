@@ -1,0 +1,6 @@
+*.clixml
+*.log
+*.state.json
+*.tmp
+*.stop
+*.log.*
