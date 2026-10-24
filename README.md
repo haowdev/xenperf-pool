@@ -212,7 +212,12 @@ share its state file between workers. There is no cross-process file lock.
   samples can coexist under different collection-host IDs.
 - Documents include `@timestamp`, numeric `value`, `xen.pool_uuid`,
   `xen.host_uuid`, `xen.host_name`, `xen.object_type`, `xen.object_uuid`,
-  `xen.metric`, `xen.cf`, and `xen.ts_epoch`.
+  `xen.metric`, `xen.cf`, and `xen.ts_epoch`. VM documents also include
+  `xen.object_name` and `xen.is_control_domain`; control-domain CPU and memory
+  metrics are collected from each host's control-domain RRD. The exporter
+  derives `dom0_memory_used_percent` from `memory`, `memory_internal_free`,
+  and the XenAPI `memory_static_max`. The dashboard plots that percentage.
+  Its metric explorer labels VM series with their XenServer name.
 - No index templates or retention policies are installed. Provision suitable
   mappings and lifecycle rules before production. Grafana expects dates,
   numeric values, and aggregatable `.keyword` subfields for string IDs.
@@ -233,10 +238,11 @@ share its state file between workers. There is no cross-process file lock.
 3. Open **XenServer Pool Overview** and use Host and Explorer Metric filters.
    The default time range is the last 24 hours.
 
-The 14 panels cover observed hosts/VMs, sample count and freshness, CPU,
-load, memory, domains, network, storage, power, and any recorded metric.
+The 16 panels cover observed hosts/VMs, sample count and freshness, CPU,
+load, memory, domains, network, storage, power, dom0 CPU and memory, and
+any recorded metric.
 Counts are observations in the selected range, not current live health.
-VM observations may include the control domain. Summary panels group by
+VM observations include each host's control domain. Summary panels group by
 pool; the dashboard is intended for one pool's dataset. Refresh only
 queries Elasticsearch; it never runs the collector.
 

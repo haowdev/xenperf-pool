@@ -28,7 +28,7 @@ $httpParams = @{ TimeoutSec = 60 }
 if ($SkipCertificateCheck) { $httpParams.SkipCertificateCheck = $true }
 
 function ConvertTo-PoolMetricDocs {
-    param([xml]$Xport, [string]$HostUuid, [string]$HostName, [string]$PoolUuid, [long]$Since)
+    param([xml]$Xport, [string]$HostUuid, [string]$HostName, [string]$PoolUuid, [long]$Since, [hashtable]$VmDetails = @{})
 
     if (-not $Xport.xport.meta -or -not $Xport.xport.data) {
         throw 'Invalid RRD response: expected xport metadata and data.'
@@ -39,6 +39,18 @@ function ConvertTo-PoolMetricDocs {
         if ($epoch -le $Since) { continue }
         $values = @($row.v)
         if ($values.Count -ne $entries.Count) { throw 'RRD legend/value count mismatch.' }
+        $vmMemory = @{}
+        for ($position = 0; $position -lt $entries.Count; $position++) {
+            $parts = $entries[$position] -split ':', 4
+            if ($parts.Count -ne 4) { throw 'Invalid RRD legend entry.' }
+            if ($parts[1] -ne 'vm' -or $parts[3] -notin @('memory', 'memory_internal_free')) { continue }
+            $raw = [string]$values[$position]
+            if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+            $memoryValue = [double]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
+            if ([double]::IsNaN($memoryValue) -or [double]::IsInfinity($memoryValue)) { continue }
+            if (-not $vmMemory.ContainsKey($parts[2])) { $vmMemory[$parts[2]] = @{} }
+            $vmMemory[$parts[2]][$parts[3]] = $memoryValue
+        }
         for ($position = 0; $position -lt $entries.Count; $position++) {
             $parts = $entries[$position] -split ':', 4
             if ($parts.Count -ne 4) { throw 'Invalid RRD legend entry.' }
@@ -46,7 +58,7 @@ function ConvertTo-PoolMetricDocs {
             if ([string]::IsNullOrWhiteSpace($raw)) { continue }
             $value = [double]::Parse($raw, [System.Globalization.CultureInfo]::InvariantCulture)
             if ([double]::IsNaN($value) -or [double]::IsInfinity($value)) { continue }
-            @{
+            $doc = @{
                 '@timestamp' = [DateTimeOffset]::FromUnixTimeSeconds($epoch).UtcDateTime.ToString('o')
                 'xen.pool_uuid' = $PoolUuid
                 'xen.host_uuid' = $HostUuid
@@ -57,6 +69,33 @@ function ConvertTo-PoolMetricDocs {
                 'xen.cf' = $parts[0]
                 'xen.ts_epoch' = $epoch
                 'value' = $value
+            }
+            if ($parts[1] -eq 'vm') {
+                $vm = $VmDetails[$parts[2]]
+                $doc['xen.object_name'] = if ($vm -and $vm.name) { $vm.name } else { $parts[2] }
+                $doc['xen.is_control_domain'] = [bool]($vm -and $vm.is_control_domain)
+            }
+            $doc
+        }
+        foreach ($vmUuid in $vmMemory.Keys) {
+            $vm = $VmDetails[$vmUuid]
+            $memoryValues = $vmMemory[$vmUuid]
+            if (-not $vm -or -not $vm.is_control_domain -or $vm.memory_total_bytes -le 0 -or
+                -not $memoryValues.ContainsKey('memory') -or -not $memoryValues.ContainsKey('memory_internal_free')) { continue }
+            $usedBytes = [Math]::Max([double]0, $memoryValues['memory'] - $memoryValues['memory_internal_free'])
+            @{
+                '@timestamp' = [DateTimeOffset]::FromUnixTimeSeconds($epoch).UtcDateTime.ToString('o')
+                'xen.pool_uuid' = $PoolUuid
+                'xen.host_uuid' = $HostUuid
+                'xen.host_name' = $HostName
+                'xen.object_type' = 'vm'
+                'xen.object_uuid' = $vmUuid
+                'xen.object_name' = $vm.name
+                'xen.is_control_domain' = $true
+                'xen.metric' = 'dom0_memory_used_percent'
+                'xen.cf' = 'AVERAGE'
+                'xen.ts_epoch' = $epoch
+                'value' = ($usedBytes / $vm.memory_total_bytes) * 100
             }
         }
     }
@@ -117,6 +156,16 @@ try {
     $poolUuid = $pools[0].uuid
     $hosts = @(Get-XenHost -SessionOpaqueRef $Session.opaque_ref)
     if (-not $hosts.Count) { throw 'No hosts were discovered in the pool.' }
+    $vmDetails = @{}
+    foreach ($vm in (Get-XenVM -SessionOpaqueRef $Session.opaque_ref)) {
+        if (-not $vm.uuid) { continue }
+        $vmUuid = [string]$vm.uuid
+        $vmDetails[$vmUuid] = @{
+            name = [string]$vm.name_label
+            is_control_domain = [bool]$vm.is_control_domain
+            memory_total_bytes = [double]$vm.memory_static_max
+        }
+    }
     $initialSince = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - $IntervalSeconds
     foreach ($poolHost in $hosts) {
         if ($poolHost.uuid -and -not $state.hosts.Contains([string]$poolHost.uuid)) {
@@ -135,8 +184,16 @@ try {
             $uri = "https://$($poolHost.address)/rrd_updates?session_id=$sessionId&start=$since&cf=AVERAGE&interval=$IntervalSeconds&host=true"
             $stage = 'RRD'
             [xml]$xport = Invoke-RestMethod -Uri $uri @httpParams
+            $dom0 = Get-XenVM -Ref $poolHost.control_domain -SessionOpaqueRef $Session.opaque_ref
+            if (-not $dom0 -or -not $dom0.is_control_domain) { throw 'Control domain VM was not found for this host.' }
+            $dom0Uri = "https://$($poolHost.address)/rrd_updates?session_id=$sessionId&start=$since&cf=AVERAGE&interval=$IntervalSeconds&uuid=$([uri]::EscapeDataString([string]$dom0.uuid))"
+            [xml]$dom0Xport = Invoke-RestMethod -Uri $dom0Uri @httpParams
             $stage = 'Index'
-            $docs = @(ConvertTo-PoolMetricDocs -Xport $xport -HostUuid $hostUuid -HostName $poolHost.name_label -PoolUuid $poolUuid -Since $since)
+            $docs = @(
+                ConvertTo-PoolMetricDocs -Xport $xport -HostUuid $hostUuid -HostName $poolHost.name_label -PoolUuid $poolUuid -Since $since -VmDetails $vmDetails |
+                    Where-Object { $_['xen.object_uuid'] -ne $dom0.uuid }
+                ConvertTo-PoolMetricDocs -Xport $dom0Xport -HostUuid $hostUuid -HostName $poolHost.name_label -PoolUuid $poolUuid -Since $since -VmDetails $vmDetails
+            )
             Write-Verbose "Host $($poolHost.name_label): collected $($docs.Count) data points; sending to Elasticsearch."
             Send-PoolMetrics -Docs $docs
             if ($docs.Count) {

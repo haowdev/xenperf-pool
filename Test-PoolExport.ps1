@@ -46,8 +46,19 @@ function Get-XenPool {
 }
 function Get-XenHost {
     param($SessionOpaqueRef)
-    [pscustomobject]@{ uuid = 'host-a'; address = 'host-a'; name_label = 'Host A' }
-    [pscustomobject]@{ uuid = 'host-b'; address = 'host-b'; name_label = 'Host B' }
+    [pscustomobject]@{ opaque_ref = 'host-ref-a'; control_domain = 'dom0-host-a'; uuid = 'host-a'; address = 'host-a'; name_label = 'Host A' }
+    [pscustomobject]@{ opaque_ref = 'host-ref-b'; control_domain = 'dom0-host-b'; uuid = 'host-b'; address = 'host-b'; name_label = 'Host B' }
+}
+function Get-XenVM {
+    param($SessionOpaqueRef, $Ref)
+    $vms = @(
+        [pscustomobject]@{ uuid = 'vm-host-a'; name_label = 'Production VM A'; is_control_domain = $false }
+        [pscustomobject]@{ uuid = 'dom0-host-a'; name_label = 'Control domain on Host A'; is_control_domain = $true; memory_static_max = 4479516672 }
+        [pscustomobject]@{ uuid = 'vm-host-b'; name_label = 'Production VM B'; is_control_domain = $false }
+        [pscustomobject]@{ uuid = 'dom0-host-b'; name_label = 'Control domain on Host B'; is_control_domain = $true; memory_static_max = 4479516672 }
+    )
+    if ($Ref) { return $vms | Where-Object { $_.uuid -eq [string]$Ref } }
+    return $vms
 }
 function Disconnect-XenServer {
     $testContext.Disconnected = $true
@@ -66,6 +77,10 @@ function Invoke-RestMethod {
             throw '401 Unauthorized'
         }
         if ($sourceHost -eq $testContext.FailHost) { throw 'Simulated host outage' }
+        if ($Uri -match '&uuid=([^&]+)') {
+            $dom0Uuid = [uri]::UnescapeDataString($Matches[1])
+            return "<xport><meta><legend><entry>AVERAGE:vm:${dom0Uuid}:cpu0</entry><entry>AVERAGE:vm:${dom0Uuid}:memory</entry><entry>AVERAGE:vm:${dom0Uuid}:memory_internal_free</entry></legend></meta><data><row><t>$($testContext.Epoch)</t><v>0.25</v><v>4294955008</v><v>2769876</v></row></data></xport>"
+        }
         return "<xport><meta><legend><entry>AVERAGE:host:${sourceHost}:cpu0</entry><entry>AVERAGE:vm:vm-${sourceHost}:memory</entry><entry>AVERAGE:host:${sourceHost}:missing</entry></legend></meta><data><row><t>$($testContext.Epoch)</t><v>0.5</v><v>1024</v><v>NaN</v></row></data></xport>"
     }
     Assert-True ($Uri -eq 'https://elastic/_bulk') 'Unexpected bulk URL'
@@ -92,13 +107,24 @@ try {
     $statePath = Join-Path $temporaryFolder 'success.json'
     & $exporter @parameters -StateFile $statePath
     $state = Get-Content $statePath -Raw | ConvertFrom-Json -AsHashtable
-    Assert-True ($testContext.Requests.Count -eq 2) 'Must query both hosts'
-    Assert-True ($testContext.Documents.Count -eq 4) 'Must export host and VM metrics, excluding NaN'
+    Assert-True ($testContext.Requests.Count -eq 4) 'Must query host and control-domain RRDs for both hosts'
+    Assert-True ($testContext.Documents.Count -eq 12) 'Must export host, VM, and control-domain CPU/memory metrics, including derived memory usage percent and excluding NaN'
     Assert-True ($state.hosts.Count -eq 2) 'Must checkpoint each successful host'
     foreach ($document in $testContext.Documents) {
         Assert-True ($document['xen.pool_uuid'] -eq 'pool-id') 'Incorrect pool identity'
         Assert-True ($document['xen.object_uuid'] -like "*$($document['xen.host_uuid'])") 'Incorrect host attribution'
+        if ($document['xen.object_type'] -eq 'vm') {
+            Assert-True ($document['xen.object_name'] -like '*VM*' -or $document['xen.object_name'] -like 'Control domain*') 'VM UUID must be accompanied by its XenServer name'
+        }
     }
+    $dom0Documents = @($testContext.Documents | Where-Object { $_['xen.is_control_domain'] })
+    Assert-True ($dom0Documents.Count -eq 8) 'Each host control domain must export CPU, memory, internal free memory, and derived usage percent'
+    Assert-True (@($dom0Documents | Where-Object { $_['xen.metric'] -eq 'cpu0' }).Count -eq 2) 'Control-domain CPU samples are missing'
+    Assert-True (@($dom0Documents | Where-Object { $_['xen.metric'] -eq 'memory' }).Count -eq 2) 'Control-domain memory samples are missing'
+    $dom0MemoryUsage = @($dom0Documents | Where-Object { $_['xen.metric'] -eq 'dom0_memory_used_percent' })
+    Assert-True ($dom0MemoryUsage.Count -eq 2) 'Derived control-domain memory usage percentage is missing'
+    $expectedDom0MemoryUsage = (([double]4294955008 - 2769876) / 4479516672) * 100
+    Assert-True (@($dom0MemoryUsage | Where-Object { [Math]::Abs($_.value - $expectedDom0MemoryUsage) -gt 0.0001 }).Count -eq 0) 'Control-domain memory usage percentage is incorrect at real memory sizes'
     $originalIds = @($testContext.Ids)
     $testContext.Ids.Clear()
     & $exporter @parameters -StateFile (Join-Path $temporaryFolder 'replay.json')
@@ -120,7 +146,7 @@ try {
         $testContext[$mode] = ''
         $testContext.Documents.Clear()
         & $exporter @parameters -StateFile $failureState
-        Assert-True ($testContext.Documents.Count -eq 2) 'Retry must recover only the failed host samples'
+        Assert-True ($testContext.Documents.Count -eq 6) 'Retry must recover only the failed host and control-domain samples'
     }
     Assert-True $testContext.Disconnected 'Session must be disconnected'
     Write-Output 'PASS: all hosts, host/VM attribution, NaN filtering, replay IDs, incremental export, partial outages, and bulk rejection.'
